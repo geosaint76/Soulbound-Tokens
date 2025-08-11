@@ -10,6 +10,10 @@
 (define-constant err-same-principal (err u106))
 (define-constant err-token-revoked (err u107))
 (define-constant err-invalid-metadata (err u108))
+(define-constant err-issuer-not-authorized (err u109))
+(define-constant err-issuer-already-exists (err u110))
+(define-constant err-issuer-not-found (err u111))
+(define-constant err-cannot-remove-owner (err u112))
 
 (define-non-fungible-token soulbound-token uint)
 
@@ -41,6 +45,18 @@
   principal
   uint
 )
+
+(define-map authorized-issuers
+  principal
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    authorized-at: uint,
+    active: bool
+  }
+)
+
+(define-data-var issuer-count uint u1)
 
 (define-read-only (get-last-token-id)
   (var-get last-token-id)
@@ -89,6 +105,33 @@
   (get-user-tokens user)
 )
 
+(define-read-only (is-authorized-issuer (issuer principal))
+  (let
+    (
+      (issuer-info (map-get? authorized-issuers issuer))
+    )
+    (match issuer-info
+      some-info (get active some-info)
+      false
+    )
+  )
+)
+
+(define-read-only (get-issuer-info (issuer principal))
+  (map-get? authorized-issuers issuer)
+)
+
+(define-read-only (get-issuer-count)
+  (var-get issuer-count)
+)
+
+(define-private (validate-issuer-metadata (name (string-ascii 64)) (description (string-ascii 256)))
+  (and
+    (> (len name) u0)
+    (> (len description) u0)
+  )
+)
+
 (define-private (add-token-to-user (user principal) (token-id uint))
   (let
     (
@@ -128,6 +171,90 @@
   )
 )
 
+(define-public (authorize-issuer
+  (issuer principal)
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-some (map-get? authorized-issuers issuer))) err-issuer-already-exists)
+    (asserts! (validate-issuer-metadata name description) err-invalid-metadata)
+    
+    (map-set authorized-issuers issuer {
+      name: name,
+      description: description,
+      authorized-at: stacks-block-height,
+      active: true
+    })
+    
+    (var-set issuer-count (+ (var-get issuer-count) u1))
+    
+    (print {
+      event: "issuer-authorized",
+      issuer: issuer,
+      name: name
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (deauthorize-issuer (issuer principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-eq issuer contract-owner)) err-cannot-remove-owner)
+    (asserts! (is-some (map-get? authorized-issuers issuer)) err-issuer-not-found)
+    
+    (map-delete authorized-issuers issuer)
+    (var-set issuer-count (- (var-get issuer-count) u1))
+    
+    (print {
+      event: "issuer-deauthorized",
+      issuer: issuer
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (suspend-issuer (issuer principal))
+  (let
+    (
+      (issuer-info (unwrap! (map-get? authorized-issuers issuer) err-issuer-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-eq issuer contract-owner)) err-cannot-remove-owner)
+    
+    (map-set authorized-issuers issuer (merge issuer-info { active: false }))
+    
+    (print {
+      event: "issuer-suspended",
+      issuer: issuer
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (reactivate-issuer (issuer principal))
+  (let
+    (
+      (issuer-info (unwrap! (map-get? authorized-issuers issuer) err-issuer-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set authorized-issuers issuer (merge issuer-info { active: true }))
+    
+    (print {
+      event: "issuer-reactivated",
+      issuer: issuer
+    })
+    
+    (ok true)
+  )
+)
+
 (define-public (mint-token
   (recipient principal)
   (name (string-ascii 64))
@@ -139,7 +266,7 @@
     (
       (token-id (+ (var-get last-token-id) u1))
     )
-    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
     (asserts! (not (is-eq recipient contract-owner)) err-same-principal)
     (asserts! (validate-metadata name description image attributes) err-invalid-metadata)
     
@@ -219,7 +346,7 @@
   (recipients (list 20 { recipient: principal, name: (string-ascii 64), description: (string-ascii 256), image: (string-ascii 256), attributes: (string-ascii 512) }))
 )
   (begin
-    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
     (ok (map mint-single-batch recipients))
   )
 )
@@ -272,3 +399,10 @@
 (define-read-only (verify-identity (user principal) (expected-token-count uint))
   (is-eq (get-user-token-count user) expected-token-count)
 )
+
+(map-set authorized-issuers contract-owner {
+  name: "Contract Owner",
+  description: "Original contract deployer with full administrative privileges",
+  authorized-at: stacks-block-height,
+  active: true
+})
