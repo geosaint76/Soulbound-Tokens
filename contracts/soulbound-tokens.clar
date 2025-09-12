@@ -14,6 +14,9 @@
 (define-constant err-issuer-already-exists (err u110))
 (define-constant err-issuer-not-found (err u111))
 (define-constant err-cannot-remove-owner (err u112))
+(define-constant err-token-expired (err u113))
+(define-constant err-invalid-expiration (err u114))
+(define-constant err-already-expired (err u115))
 
 (define-non-fungible-token soulbound-token uint)
 
@@ -27,7 +30,9 @@
     image: (string-ascii 256),
     issued-at: uint,
     issuer: principal,
-    attributes: (string-ascii 512)
+    attributes: (string-ascii 512),
+    expires-at: (optional uint),
+    renewable: bool
   }
 )
 
@@ -129,6 +134,68 @@
   (and
     (> (len name) u0)
     (> (len description) u0)
+  )
+)
+
+(define-read-only (is-token-expired (token-id uint))
+  (let
+    (
+      (metadata (get-token-metadata token-id))
+    )
+    (match metadata
+      some-metadata 
+        (match (get expires-at some-metadata)
+          some-expiration (>= stacks-block-height some-expiration)
+          false
+        )
+      false
+    )
+  )
+)
+
+(define-read-only (is-token-valid (token-id uint))
+  (and
+    (is-token-active token-id)
+    (not (is-token-expired token-id))
+  )
+)
+
+(define-read-only (get-token-expiration (token-id uint))
+  (let
+    (
+      (metadata (get-token-metadata token-id))
+    )
+    (match metadata
+      some-metadata (get expires-at some-metadata)
+      none
+    )
+  )
+)
+
+(define-read-only (blocks-until-expiration (token-id uint))
+  (let
+    (
+      (expiration (get-token-expiration token-id))
+    )
+    (match expiration
+      some-exp 
+        (if (> some-exp stacks-block-height)
+          (some (- some-exp stacks-block-height))
+          (some u0)
+        )
+      none
+    )
+  )
+)
+
+(define-read-only (get-valid-tokens-for-user (user principal))
+  (filter is-token-valid (get-user-tokens user))
+)
+
+(define-private (validate-expiration (expires-at (optional uint)))
+  (match expires-at
+    some-expiration (> some-expiration stacks-block-height)
+    true
   )
 )
 
@@ -278,7 +345,9 @@
       image: image,
       issued-at: stacks-block-height,
       issuer: tx-sender,
-      attributes: attributes
+      attributes: attributes,
+      expires-at: none,
+      renewable: false
     })
     
     (map-set token-status token-id { active: true })
@@ -290,6 +359,54 @@
       token-id: token-id,
       recipient: recipient,
       name: name
+    })
+    
+    (ok token-id)
+  )
+)
+
+(define-public (mint-token-with-expiration
+  (recipient principal)
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (image (string-ascii 256))
+  (attributes (string-ascii 512))
+  (expires-at uint)
+  (renewable bool)
+)
+  (let
+    (
+      (token-id (+ (var-get last-token-id) u1))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
+    (asserts! (not (is-eq recipient contract-owner)) err-same-principal)
+    (asserts! (validate-metadata name description image attributes) err-invalid-metadata)
+    (asserts! (validate-expiration (some expires-at)) err-invalid-expiration)
+    
+    (try! (nft-mint? soulbound-token token-id recipient))
+    
+    (map-set token-metadata token-id {
+      name: name,
+      description: description,
+      image: image,
+      issued-at: stacks-block-height,
+      issuer: tx-sender,
+      attributes: attributes,
+      expires-at: (some expires-at),
+      renewable: renewable
+    })
+    
+    (map-set token-status token-id { active: true })
+    (add-token-to-user recipient token-id)
+    (var-set last-token-id token-id)
+    
+    (print {
+      event: "mint-with-expiration",
+      token-id: token-id,
+      recipient: recipient,
+      name: name,
+      expires-at: expires-at,
+      renewable: renewable
     })
     
     (ok token-id)
@@ -385,6 +502,80 @@
     
     (print {
       event: "metadata-update",
+      token-id: token-id
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (extend-token-expiration (token-id uint) (new-expires-at uint))
+  (let
+    (
+      (metadata (unwrap! (get-token-metadata token-id) err-token-not-found))
+      (token-owner (unwrap! (nft-get-owner? soulbound-token token-id) err-token-not-found))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
+    (asserts! (is-token-active token-id) err-token-revoked)
+    (asserts! (get renewable metadata) err-invalid-expiration)
+    (asserts! (validate-expiration (some new-expires-at)) err-invalid-expiration)
+    
+    (map-set token-metadata token-id (merge metadata {
+      expires-at: (some new-expires-at)
+    }))
+    
+    (print {
+      event: "expiration-extended",
+      token-id: token-id,
+      new-expires-at: new-expires-at,
+      owner: token-owner
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-expired-token (token-id uint) (new-expires-at uint))
+  (let
+    (
+      (metadata (unwrap! (get-token-metadata token-id) err-token-not-found))
+      (token-owner (unwrap! (nft-get-owner? soulbound-token token-id) err-token-not-found))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
+    (asserts! (is-token-active token-id) err-token-revoked)
+    (asserts! (get renewable metadata) err-invalid-expiration)
+    (asserts! (is-token-expired token-id) err-already-expired)
+    (asserts! (validate-expiration (some new-expires-at)) err-invalid-expiration)
+    
+    (map-set token-metadata token-id (merge metadata {
+      expires-at: (some new-expires-at)
+    }))
+    
+    (print {
+      event: "token-renewed",
+      token-id: token-id,
+      new-expires-at: new-expires-at,
+      owner: token-owner
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (make-token-renewable (token-id uint))
+  (let
+    (
+      (metadata (unwrap! (get-token-metadata token-id) err-token-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-token-active token-id) err-token-revoked)
+    
+    (map-set token-metadata token-id (merge metadata {
+      renewable: true
+    }))
+    
+    (print {
+      event: "token-made-renewable",
       token-id: token-id
     })
     
