@@ -17,6 +17,9 @@
 (define-constant err-token-expired (err u113))
 (define-constant err-invalid-expiration (err u114))
 (define-constant err-already-expired (err u115))
+(define-constant err-category-not-found (err u116))
+(define-constant err-category-already-exists (err u117))
+(define-constant err-invalid-category (err u118))
 
 (define-non-fungible-token soulbound-token uint)
 
@@ -32,7 +35,8 @@
     issuer: principal,
     attributes: (string-ascii 512),
     expires-at: (optional uint),
-    renewable: bool
+    renewable: bool,
+    category-id: (optional uint)
   }
 )
 
@@ -62,6 +66,24 @@
 )
 
 (define-data-var issuer-count uint u1)
+
+(define-map token-categories
+  uint
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    icon: (string-ascii 256),
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map category-token-counts
+  uint
+  uint
+)
+
+(define-data-var last-category-id uint u0)
 
 (define-read-only (get-last-token-id)
   (var-get last-token-id)
@@ -134,6 +156,145 @@
   (and
     (> (len name) u0)
     (> (len description) u0)
+  )
+)
+
+(define-read-only (get-category (category-id uint))
+  (map-get? token-categories category-id)
+)
+
+(define-read-only (get-category-token-count (category-id uint))
+  (default-to u0 (map-get? category-token-counts category-id))
+)
+
+(define-read-only (get-last-category-id)
+  (var-get last-category-id)
+)
+
+(define-read-only (is-category-active (category-id uint))
+  (let
+    (
+      (category (get-category category-id))
+    )
+    (match category
+      some-cat (get active some-cat)
+      false
+    )
+  )
+)
+
+(define-private (validate-category-metadata (name (string-ascii 64)) (description (string-ascii 256)) (icon (string-ascii 256)))
+  (and
+    (> (len name) u0)
+    (> (len description) u0)
+    (> (len icon) u0)
+  )
+)
+
+(define-private (increment-category-count (category-id uint))
+  (let
+    (
+      (current-count (get-category-token-count category-id))
+    )
+    (map-set category-token-counts category-id (+ current-count u1))
+    true
+  )
+)
+
+(define-public (create-category
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (icon (string-ascii 256))
+)
+  (let
+    (
+      (category-id (+ (var-get last-category-id) u1))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-category-metadata name description icon) err-invalid-category)
+    
+    (map-set token-categories category-id {
+      name: name,
+      description: description,
+      icon: icon,
+      created-at: stacks-block-height,
+      active: true
+    })
+    
+    (map-set category-token-counts category-id u0)
+    (var-set last-category-id category-id)
+    
+    (print {
+      event: "category-created",
+      category-id: category-id,
+      name: name
+    })
+    
+    (ok category-id)
+  )
+)
+
+(define-public (update-category
+  (category-id uint)
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (icon (string-ascii 256))
+)
+  (let
+    (
+      (category (unwrap! (get-category category-id) err-category-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (validate-category-metadata name description icon) err-invalid-category)
+    
+    (map-set token-categories category-id (merge category {
+      name: name,
+      description: description,
+      icon: icon
+    }))
+    
+    (print {
+      event: "category-updated",
+      category-id: category-id
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-category (category-id uint))
+  (let
+    (
+      (category (unwrap! (get-category category-id) err-category-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set token-categories category-id (merge category { active: false }))
+    
+    (print {
+      event: "category-deactivated",
+      category-id: category-id
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (reactivate-category (category-id uint))
+  (let
+    (
+      (category (unwrap! (get-category category-id) err-category-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set token-categories category-id (merge category { active: true }))
+    
+    (print {
+      event: "category-reactivated",
+      category-id: category-id
+    })
+    
+    (ok true)
   )
 )
 
@@ -347,7 +508,8 @@
       issuer: tx-sender,
       attributes: attributes,
       expires-at: none,
-      renewable: false
+      renewable: false,
+      category-id: none
     })
     
     (map-set token-status token-id { active: true })
@@ -393,7 +555,8 @@
       issuer: tx-sender,
       attributes: attributes,
       expires-at: (some expires-at),
-      renewable: renewable
+      renewable: renewable,
+      category-id: none
     })
     
     (map-set token-status token-id { active: true })
@@ -410,6 +573,79 @@
     })
     
     (ok token-id)
+  )
+)
+
+(define-public (mint-token-in-category
+  (recipient principal)
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (image (string-ascii 256))
+  (attributes (string-ascii 512))
+  (category-id uint)
+)
+  (let
+    (
+      (token-id (+ (var-get last-token-id) u1))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-issuer-not-authorized)
+    (asserts! (not (is-eq recipient contract-owner)) err-same-principal)
+    (asserts! (validate-metadata name description image attributes) err-invalid-metadata)
+    (asserts! (is-category-active category-id) err-category-not-found)
+    
+    (try! (nft-mint? soulbound-token token-id recipient))
+    
+    (map-set token-metadata token-id {
+      name: name,
+      description: description,
+      image: image,
+      issued-at: stacks-block-height,
+      issuer: tx-sender,
+      attributes: attributes,
+      expires-at: none,
+      renewable: false,
+      category-id: (some category-id)
+    })
+    
+    (map-set token-status token-id { active: true })
+    (add-token-to-user recipient token-id)
+    (increment-category-count category-id)
+    (var-set last-token-id token-id)
+    
+    (print {
+      event: "mint-in-category",
+      token-id: token-id,
+      recipient: recipient,
+      category-id: category-id,
+      name: name
+    })
+    
+    (ok token-id)
+  )
+)
+
+(define-public (assign-token-to-category (token-id uint) (category-id uint))
+  (let
+    (
+      (metadata (unwrap! (get-token-metadata token-id) err-token-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-category-active category-id) err-category-not-found)
+    (asserts! (is-token-active token-id) err-token-revoked)
+    
+    (map-set token-metadata token-id (merge metadata {
+      category-id: (some category-id)
+    }))
+    
+    (increment-category-count category-id)
+    
+    (print {
+      event: "token-categorized",
+      token-id: token-id,
+      category-id: category-id
+    })
+    
+    (ok true)
   )
 )
 
