@@ -20,6 +20,7 @@
 (define-constant err-category-not-found (err u116))
 (define-constant err-category-already-exists (err u117))
 (define-constant err-invalid-category (err u118))
+(define-constant err-category-cap-reached (err u119))
 
 (define-non-fungible-token soulbound-token uint)
 
@@ -79,6 +80,11 @@
 )
 
 (define-map category-token-counts
+  uint
+  uint
+)
+
+(define-map category-caps
   uint
   uint
 )
@@ -167,6 +173,20 @@
   (default-to u0 (map-get? category-token-counts category-id))
 )
 
+(define-read-only (get-category-cap (category-id uint))
+  (default-to u0 (map-get? category-caps category-id))
+)
+
+(define-read-only (is-category-cap-reached (category-id uint))
+  (let
+    (
+      (cap (get-category-cap category-id))
+      (count (get-category-token-count category-id))
+    )
+    (and (> cap u0) (>= count cap))
+  )
+)
+
 (define-read-only (get-last-category-id)
   (var-get last-category-id)
 )
@@ -198,6 +218,23 @@
     )
     (map-set category-token-counts category-id (+ current-count u1))
     true
+  )
+)
+
+(define-public (set-category-cap (category-id uint) (cap uint))
+  (let
+    (
+      (category (unwrap! (get-category category-id) err-category-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set category-caps category-id cap)
+    (print {
+      event: "category-cap-set",
+      category-id: category-id,
+      cap: cap,
+      active: (get active category)
+    })
+    (ok true)
   )
 )
 
@@ -592,6 +629,7 @@
     (asserts! (not (is-eq recipient contract-owner)) err-same-principal)
     (asserts! (validate-metadata name description image attributes) err-invalid-metadata)
     (asserts! (is-category-active category-id) err-category-not-found)
+    (asserts! (not (is-category-cap-reached category-id)) err-category-cap-reached)
     
     (try! (nft-mint? soulbound-token token-id recipient))
     
@@ -833,3 +871,5 @@
   authorized-at: stacks-block-height,
   active: true
 })
+ 
+  
