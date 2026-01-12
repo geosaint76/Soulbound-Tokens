@@ -729,6 +729,28 @@
   )
 )
 
+(define-public (self-burn-token (token-id uint))
+  (let
+    (
+      (token-owner (unwrap! (nft-get-owner? soulbound-token token-id) err-token-not-found))
+    )
+    (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+    
+    (try! (nft-burn? soulbound-token token-id token-owner))
+    (map-delete token-metadata token-id)
+    (map-delete token-status token-id)
+    (remove-token-from-user token-owner token-id)
+    
+    (print {
+      event: "self-burn",
+      token-id: token-id,
+      owner: token-owner
+    })
+    
+    (ok true)
+  )
+)
+
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (err err-transfer-not-allowed)
 )
